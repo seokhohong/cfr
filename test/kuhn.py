@@ -11,7 +11,7 @@ import random
 import itertools
 
 from game.poker import PokerActions
-from optimizer.cfr import VanillaCFR, ChanceSamplingCFR
+from optimizer.cfr import VanillaCFR, ChanceSamplingCFR, ExternalSamplingCFR
 
 
 class TestKuhnMethods(unittest.TestCase):
@@ -55,7 +55,7 @@ class TestKuhnMethods(unittest.TestCase):
 
     def test_kuhn_to_move_chance_at_root(self):
         root = self.get_chance_node()
-        assert root.get_player_to_move() == poker.ChancePlayer
+        assert root.get_player_to_move() == player.ChancePlayer
 
     def test_kuhn_to_move_changes_correctly_for_children(self):
         logical_expression = lambda node: all([node.get_player_to_move() == node.get_children()[k].get_player_to_move().get_next() for k in node.get_children()])
@@ -309,10 +309,48 @@ class TestKuhnMethods(unittest.TestCase):
         root = game.create_root_node()
 
         chance_cfr = ChanceSamplingCFR(root, players)
-        chance_cfr.run(iterations=100)
+        chance_cfr.run(iterations=200)
         chance_cfr.compute_nash_equilibrium()
 
         game_value = chance_cfr.value_of_the_game()
+        self.assertTrue(game_value[0] > -3. / 48)
+        self.assertTrue(game_value[0] < -1. / 48)
+        self.assertTrue(4. / 48 > game_value[2] > 2. / 48)
+
+    def test_external_sampling(self):
+        deck = pydealer.Deck()
+
+        cards = deck.get_list(['Jack of Spades', 'Queen of Spades', 'King of Spades'])
+        players = create_player_set(2)
+
+        game = KuhnGame(players, cards, num_deal=1)
+
+        root = game.create_root_node()
+
+        chance_cfr = ExternalSamplingCFR(root, players)
+        chance_cfr.run(iterations=1000)
+        game_value = chance_cfr.approximate_value_of_game(1000)
+
+        epsilon = 0.01
+
+        self.assertTrue(game_value[0] < -1. / 18 + epsilon)
+        self.assertTrue(game_value[1] > 1. / 18 - epsilon)
+
+    def test_external_sampling_2(self):
+        deck = pydealer.Deck()
+
+        cards = deck.get_list(['10 of Spades', 'Jack of Spades', 'Queen of Spades', 'King of Spades'])
+        players = create_player_set(3)
+
+        game = KuhnGame(players, cards, num_deal=1)
+
+        root = game.create_root_node()
+
+        chance_cfr = ExternalSamplingCFR(root, players)
+        chance_cfr.run(iterations=2000)
+        chance_cfr.compute_nash_equilibrium()
+
+        game_value = chance_cfr.approximate_value_of_game(1000)
         self.assertTrue(game_value[0] > -3. / 48)
         self.assertTrue(game_value[0] < -1. / 48)
         self.assertTrue(4. / 48 > game_value[2] > 2. / 48)

@@ -1,9 +1,12 @@
 import numpy as np
 from collections import defaultdict
 from game.poker import PokerActions
+import random
 
 def init_empty_node_maps(players, node, output = None):
-    output = defaultdict(dict)
+    level_1 = lambda: defaultdict(int)
+    level_2 = lambda: defaultdict(level_1)
+    output = defaultdict(level_2)
     def init_empty_node_maps_recursive(node):
         if node.is_chance():
             for player in players:
@@ -13,7 +16,7 @@ def init_empty_node_maps(players, node, output = None):
             output[player.get_index()][node.inf_set()] = {action: 0. for action in node.actions}
         for k in node.get_children():
             init_empty_node_maps_recursive(node.get_children()[k])
-    init_empty_node_maps_recursive(node)
+    #init_empty_node_maps_recursive(node)
     return output
 
 class MultiplayerCFRMBase:
@@ -32,6 +35,7 @@ class CounterfactualRegretMinimizationBase:
         self.cumulative_regrets = init_empty_node_maps(players, root)
         self.cumulative_sigma = init_empty_node_maps(players, root)
         self.nash_equilibrium = init_empty_node_maps(players, root)
+        self._learned_strategy = init_empty_node_maps(players, root)
         self.chance_sampling = chance_sampling
         self._players = players
 
@@ -43,7 +47,7 @@ class CounterfactualRegretMinimizationBase:
         normalizing_sum = 0
         strategy = {}
         for action in actions:
-            regret = max(self.cumulative_regrets[player_index][info_set][action], 0)
+            regret = max(self.cumulative_regrets[info_set][action], 0)
             strategy[action] = regret
             normalizing_sum += regret
         for action in actions:
@@ -51,6 +55,7 @@ class CounterfactualRegretMinimizationBase:
                 strategy[action] /= normalizing_sum
             else:
                 strategy[action] = 1. / len(actions)
+        self._learned_strategy[info_set] = strategy
         return strategy
 
 
@@ -67,15 +72,10 @@ class CounterfactualRegretMinimizationBase:
         else:
             player_index = node.get_player_to_move().get_index()
             sigma_sum = sum(self.cumulative_sigma[player_index][i].values())
-            if sigma_sum == 0:
-                print('what')
             self.nash_equilibrium[player_index][i] = {a: self.cumulative_sigma[player_index][i][a] / sigma_sum for a in node.actions}
         # go to subtrees
         for child in node.get_children().values():
             self.__compute_ne_rec(child)
-
-    def _cumulate_cfr_regret(self, player_index, information_set, action, regret):
-        self.cumulative_regrets[player_index][information_set][action] += regret
 
     def _cumulate_sigma(self, player_index, information_set, action, prob):
         #print('Update Sigma', information_set, '          ', action, prob)
@@ -93,6 +93,8 @@ class CounterfactualRegretMinimizationBase:
         for player in self._players:
             values[player] = value
         return values
+
+
 
     def _cfr_utility_recursive(self, state, reach_vector):
         action_utilities = {}
@@ -119,9 +121,6 @@ class CounterfactualRegretMinimizationBase:
             for player in self._players:
                 node_utilities[player.get_index()] += strategy[action] * action_utilities[action][player.get_index()]
 
-        #if len(state.actions_history) == 2 and state.actions_history[0][1] == PokerActions.RAISE_1 and state.actions_history[1][1] == PokerActions.FOLD:
-        #    print('2BC')
-
         # accumulate regret
         for action in state.actions:
             # likelihood of arriving at this state given our strategy
@@ -133,15 +132,10 @@ class CounterfactualRegretMinimizationBase:
             player_index = state.get_player_to_move().get_index()
             regret = action_utilities[action][player_index] - node_utilities[player_index]
 
-            player_index = state.get_player_to_move().get_index()
             info_set = state.inf_set()
-            self.cumulative_regrets[player_index][info_set][action] += counterfactual * regret
-            self.cumulative_sigma[player_index][info_set][action] += counterfactual * strategy[action]
+            self.cumulative_regrets[info_set][action] += counterfactual * regret
+            self.cumulative_sigma[info_set][action] += counterfactual * strategy[action]
 
-        #if self.chance_sampling:
-            # update sigma according to cumulative regrets - we can do it here because we are using chance sampling
-            # and so we only visit single game_state from an information set (chance is sampled once)
-            #self._update_sigma(state.inf_set())
         return node_utilities
 
     def __value_of_the_game_state_recursive(self, node):
@@ -191,3 +185,92 @@ class ChanceSamplingCFR(CounterfactualRegretMinimizationBase):
     def run(self, iterations=1):
         for _ in range(0, iterations):
             self._cfr_utility_recursive(self.root, np.ones(len(self._players)))
+
+class ExternalSamplingCFR(CounterfactualRegretMinimizationBase):
+    def __init__(self, root, players):
+        super().__init__(root=root, players=players, chance_sampling=True)
+
+    def run(self, iterations=1):
+        utilities = np.zeros(len(self._players))
+        for _ in range(0, iterations):
+            sampling_memory = {}
+            for player in self._players:
+                utilities += self._perspective_cfr_utility_recursive(player, sampling_memory, self.root, np.ones(len(self._players)))
+        return utilities
+
+    def _perspective_cfr_utility_recursive(self, perspective, sampling_memory, state, reach_vector):
+        action_utilities = {}
+        node_utilities = np.zeros(len(self._players))
+        info_set = state.inf_set()
+
+        if state.is_terminal():
+            return state.evaluation()
+        if state.is_chance():
+            return self._perspective_cfr_utility_recursive(perspective, sampling_memory, state.sample_one(), reach_vector)
+
+        strategy = self.get_strategy(state)
+
+        # if the player to move is not the player we're focused for perspective
+        if state.get_player_to_move() != perspective:
+            # sample a random action
+            weight_vector = [strategy[action] for action in state.actions]
+            #action_sampled = sampling_memory[info_set] if info_set in sampling_memory else np.random.choice(state.actions, p=weight_vector)
+            action_sampled = np.random.choice(state.actions, p=weight_vector)
+
+            # remember the action for future iterations on the same infoset
+            #sampling_memory[info_set] = action_sampled
+
+            # update reach vector for next iteration
+            reach_vector_child = np.copy(reach_vector)
+            reach_vector_child[state.get_player_to_move().get_index()] *= strategy[action_sampled]
+
+            # no update to regrets
+            return self._perspective_cfr_utility_recursive(perspective, sampling_memory,
+                                                            state.play(action_sampled), reach_vector_child)
+
+        # if player to move IS player we're focused on for perspective
+        for action in state.actions:
+            reach_vector_child = np.copy(reach_vector)
+            reach_vector_child[state.get_player_to_move().get_index()] *= strategy[action]
+
+            action_utilities[action] = self._perspective_cfr_utility_recursive(perspective, sampling_memory,
+                                                                               state.play(action), reach_vector_child)
+
+            node_utilities = strategy[action] * action_utilities[action]
+
+        # accumulate regret
+        for action in state.actions:
+            # likelihood of arriving at this state given our strategy assuming our perspective player wanted to get there
+            perspective_index = perspective.get_index()
+            #print(reach_vector)
+            counterfactual = 1
+            for player in self._players:
+                if player != state.get_player_to_move():
+                    counterfactual *= reach_vector[player.get_index()]
+
+            regret = action_utilities[action][perspective_index] - node_utilities[perspective_index]
+
+            self.cumulative_regrets[info_set][action] += counterfactual * regret
+            #self.cumulative_sigma[perspective_index][info_set][action] += counterfactual * strategy[action]
+
+        return node_utilities
+
+    def compute_nash_equilibrium(self):
+        RuntimeError("Not Implemented for scability reasons")
+
+    def run_simulation(self):
+        curr_node = self.root
+        while not curr_node.is_terminal():
+            if curr_node.is_chance():
+                curr_node = curr_node.play(random.choice(curr_node.actions))
+            else:
+                strategy = self.get_strategy(curr_node)
+                weight_vector = [strategy[action] for action in curr_node.actions]
+                curr_node = curr_node.play(np.random.choice(curr_node.actions, p=weight_vector))
+        return curr_node.evaluation()
+
+    def approximate_value_of_game(self, num_simulations=100):
+        values = np.zeros(len(self._players))
+        for i in range(num_simulations):
+            values += self.run_simulation()
+        return values / num_simulations
